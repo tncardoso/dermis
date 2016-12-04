@@ -1,5 +1,7 @@
 # Dermis
 
+![dermis](https://raw.githubusercontent.com/tncardoso/dermis/master/dermis.png)
+
 Dermis is an experiment with libc wrappers. Dermis uses lua for changing
 the behavior of libc functions.
 
