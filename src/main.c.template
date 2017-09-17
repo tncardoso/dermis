@@ -1,0 +1,175 @@
+// Copyright (c) 2016, Thiago Cardoso
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//
+//  * Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//  * Redistributions in binary form must reproduce the above
+//    copyright notice, this list of conditions and the following
+//    disclaimer in the documentation and/or other materials provided
+//    with the distribution.
+//  * Neither the name of  nor the names of its contributors may be
+//    used to endorse or promote products derived from this software
+//    without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+// FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+// COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+// INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+// (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+// SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+// HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+// STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+// OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <dlfcn.h>
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+#include "macros.h"
+
+// Struct that represents a libc function.
+struct dermis_func {
+    // Pointer to the original function.
+    void* original;
+    // Detour id as stored in lua RegistryIndex.
+    int detour;
+};
+
+// Struct containing all functions covered by Dermis.
+struct dermis {
+    {% for f in functions %}
+    struct dermis_func {{ f.name }};
+    {% endfor %}
+};
+
+// Pointers to functions and detours for wrapped functions.
+static struct dermis dermis_core;
+
+// Lua virtual machine.
+static lua_State *dermis_lua;
+
+// Call original libc function.
+
+{% for f in functions %}
+{{ f.ret.c_type() }} {{ f.name }}_original ({{ f.args_declaration() }}) {
+    if (!dermis_core.{{ f.name }}.original) {
+        dermis_core.{{ f.name }}.original = dlsym(RTLD_NEXT, "{{ f.name }}");
+    }
+    {{ f.ret.c_type() }} (*original)({{ f.args_types() }}) = dermis_core.{{ f.name }}.original;
+    return (*original)({{ f.args_names() }});
+}
+{% endfor %}
+
+// Functions available from lua.
+
+{% for f in functions %}
+int {{ f.name }}_lua(lua_State *L) {
+    {% for arg in f.args %}{{ arg.type.c_type() }} {{ arg.name }} = ({{ arg.type.c_type() }}) {{ arg.type.lua_to() }}(L, {{ loop.index }}); {% endfor %}
+    {{ f.ret.lua_push() }}(L, {{ f.name }}_original({{ f.args_names() }}));
+    return 1;
+}
+{% endfor %}
+
+// Wrap libc functions.
+
+{% for f in functions %}
+{{ f.ret.c_type() }} {{ f.name }} ({{ f.args_declaration() }}) {
+    if (dermis_core.{{ f.name }}.detour) {
+        lua_rawgeti(dermis_lua, LUA_REGISTRYINDEX, dermis_core.{{ f.name }}.detour);
+        {% for arg in f.args %}
+        {{ arg.type.lua_push() }}(dermis_lua, ({{ arg.type.c_type() }}) {{ arg.name }});{% endfor %}
+
+        // Call lua function with provided paramenters.
+        if (lua_pcall(dermis_lua, {{ f.args|length }}, 1, 0) != 0) {
+            ERROR("could not call function: %s\n", lua_tostring(dermis_lua, -1));
+            return {{ f.name }}_original({{ f.args_names() }});
+        }
+
+        // Pop and check returned value.
+        if (!{{ f.ret.lua_is() }}(dermis_lua, -1)) {
+            ERROR("expected return type = %s got = %s\n", "{{ f.ret.name }}", lua_typename(dermis_lua, lua_type(dermis_lua, -2)));
+            return {{ f.name }}_original({{ f.args_names() }});
+        }
+
+        {{ f.ret.c_type() }} ret = ({{ f.ret.c_type() }}) {{ f.ret.lua_to() }}(dermis_lua, 1);
+        lua_pop(dermis_lua, 1);
+        return ret;
+    } else {
+        return {{ f.name }}_original({{ f.args_names() }});
+    }
+}
+{% endfor %}
+
+// Register callback from lua
+
+{% for f in functions %}
+static int l_register_{{ f.name }} (lua_State *L) {
+    if (!lua_isfunction(L, -1)) { \
+        ERROR("could not register {{ f.name }}: second parameter is not a function\n");
+        return 0;
+    }
+
+    if (dermis_core.{{ f.name }}.detour) {
+        luaL_unref(dermis_lua, LUA_REGISTRYINDEX, dermis_core.{{ f.name }}.detour);
+    }
+
+    dermis_core.{{ f.name }}.detour = luaL_ref(dermis_lua, LUA_REGISTRYINDEX);
+    lua_pushboolean(L, 1);
+    return 0;
+}
+{% endfor %}
+
+
+// Function executed when this module is loaded via LD_PRELOAD or
+// similar technique. The lua state is initialized and functions are
+// registered.
+static void dermis_init() __attribute__((constructor));
+static void dermis_init() {
+    INFO("loaded dermis\n");
+
+    INFO("initing lua state\n");
+    dermis_lua = luaL_newstate();
+    luaL_openlibs(dermis_lua);
+
+    // Register available functions in lua. These functions include
+    // wrapper functions and dermis' API.
+    // You need to check this point when adding new functions to Dermis.
+    INFO("registering functions in lua\n");
+    {% for f in functions %}
+    // Register {{ f.name }}
+    lua_pushcfunction(dermis_lua, {{ f.name }}_lua);
+    lua_setglobal(dermis_lua, "dermis_{{ f.name }}");
+    lua_pushcfunction(dermis_lua, l_register_{{ f.name }});
+    lua_setglobal(dermis_lua, "dermis_register_{{ f.name }}");
+
+    {% endfor %}
+
+    // The lua script that will be executed should be passed via DERMIS
+    // environment variable.
+    char *fname = getenv("DERMIS");
+    if (!fname) {
+        ERROR("DERMIS env not set with lua script, aborting!\n");
+        return;
+    }
+
+    if (luaL_loadfile(dermis_lua, fname)) {
+        ERROR("could not load file '%s', aborting!\n", fname);
+    } else {
+        int callret = lua_pcall(dermis_lua, 0, 0, 0);
+        if (callret) {
+            ERROR("could not execute file '%s' error= %d!\n", fname, callret);
+        }
+    }
+}
